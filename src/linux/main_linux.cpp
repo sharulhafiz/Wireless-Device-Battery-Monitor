@@ -79,8 +79,13 @@ struct State {
     GDBusConnection* conn = nullptr;
     std::vector<DeviceStatus> devices;
     std::vector<std::unique_ptr<TrayItem>> items;
+    // Retired icons stay allocated: their connection is closed, but a property read that was already
+    // queued on it can still be dispatched against the item afterwards (use-after-free). The set is
+    // bounded by the number of devices seen in one session.
+    std::vector<std::unique_ptr<TrayItem>> retired;
     std::map<std::string, std::string> hideActions;  // action name -> device key
     int nextSlot = 1;
+    guint watcherWatch = 0;
     std::mutex mu;
     std::condition_variable cv;
     std::vector<DeviceStatus> pending;
@@ -94,7 +99,7 @@ struct State {
 State g;
 
 void RecomputePresentation();
-GVariant* SafeString(const std::string& s);
+GVariant* SafeString(const std::string& s, const char* site);
 
 // ---- settings (GKeyFile under $XDG_CONFIG_HOME) ------------------------------------------------
 
@@ -272,7 +277,7 @@ void AddMenuProperties(GVariantBuilder& props, const MenuNode* n) {
         g_variant_builder_add(&props, "{sv}", "type", g_variant_new_string("separator"));
         return;
     }
-    g_variant_builder_add(&props, "{sv}", "label", SafeString(n->label));
+    g_variant_builder_add(&props, "{sv}", "label", SafeString(n->label, "menu-label"));
     g_variant_builder_add(&props, "{sv}", "enabled", g_variant_new_boolean(n->enabled));
     g_variant_builder_add(&props, "{sv}", "visible", g_variant_new_boolean(TRUE));
     g_variant_builder_add(&props, "{sv}", "type", g_variant_new_string(n->toggle ? "checkbox" : "standard"));
@@ -319,10 +324,10 @@ void EmitSignal(TrayItem& it, const char* name) {
 
 // Device names come from firmware (HID product strings, BlueZ aliases) and are not guaranteed to be
 // valid UTF-8. D-Bus strings must be, so repair anything that is not.
-GVariant* SafeString(const std::string& s) {
+GVariant* SafeString(const std::string& s, const char* site) {
     if (g_utf8_validate(s.c_str(), (gssize)s.size(), nullptr)) return g_variant_new_string(s.c_str());
     g_autofree gchar* fixed = g_utf8_make_valid(s.c_str(), (gssize)s.size());
-    g_warning("Invalid UTF-8 in device string, sanitised: \"%s\"", fixed);
+    g_warning("Invalid UTF-8 (%s, %zu bytes), sanitised: \"%s\"", site, s.size(), fixed);
     return g_variant_new_string(fixed);
 }
 
@@ -382,17 +387,17 @@ static GVariant* sni_get_property(GDBusConnection*, const gchar*, const gchar*, 
                                   const gchar* name, GError**, gpointer user_data) {
     TrayItem* it = static_cast<TrayItem*>(user_data);
     if (!it) return nullptr;
-    if (!strcmp(name, "Id")) return SafeString(it->id);
+    if (!strcmp(name, "Id")) return SafeString(it->id, "id");
     if (!strcmp(name, "Category")) return g_variant_new_string("SystemServices");
-    if (!strcmp(name, "Title")) return SafeString(it->title);
+    if (!strcmp(name, "Title")) return SafeString(it->title, "title");
     // Empty IconName: the host falls back to the pixmap we draw (percentage text + level bar).
     if (!strcmp(name, "IconName")) return g_variant_new_string("");
     if (!strcmp(name, "IconPixmap"))
         return it->pixmap ? g_variant_ref(it->pixmap) : RenderPixmap(-1, false, true, false);
     if (!strcmp(name, "ToolTip")) {
         GVariant* px = it->pixmap ? g_variant_ref(it->pixmap) : RenderPixmap(-1, false, true, false);
-        return g_variant_new("(s@a(iiay)@s@s)", "", px, SafeString(it->title),
-                             SafeString(it->tooltipText));
+        return g_variant_new("(s@a(iiay)@s@s)", "", px, SafeString(it->title, "title"),
+                             SafeString(it->tooltipText, "tooltip"));
     }
     if (!strcmp(name, "Menu")) return g_variant_new_object_path(kMenuPath);
     if (!strcmp(name, "ItemIsMenu")) return g_variant_new_boolean(TRUE);
@@ -577,10 +582,7 @@ TrayItem* CreateItem(const std::string& key, int slot) {
 }
 
 void DestroyItem(TrayItem* it) {
-    if (it->pixmap) {
-        g_variant_unref(it->pixmap);
-        it->pixmap = nullptr;
-    }
+    // The pixmap is deliberately not released: a queued property read may still reference it.
     if (it->conn) {
         // Closing the connection is what makes the host drop the icon.
         g_dbus_connection_close_sync(it->conn, nullptr, nullptr);
@@ -594,6 +596,13 @@ TrayItem* FindItem(const std::string& key) {
     for (auto& p : g.items)
         if (p->key == key) return p.get();
     return nullptr;
+}
+
+// Hosts restart their watcher (panel reload, cinnamon --replace). Every registration belongs to the
+// watcher instance that was running at the time, so all icons must be re-announced when one appears.
+void RegisterAllWithWatcher() {
+    for (auto& p : g.items)
+        if (p->conn) RegisterWithWatcher(p->conn, kSniPath);
 }
 
 // ---- per-item content -------------------------------------------------------------------------
@@ -730,11 +739,12 @@ void RecomputePresentation() {
     }
 
     // Icons whose device disappeared or was hidden go away.
-    for (auto& p : g.items)
-        if (!p->wanted) DestroyItem(p.get());
-    g.items.erase(std::remove_if(g.items.begin(), g.items.end(),
-                                 [](const std::unique_ptr<TrayItem>& p) { return !p->wanted; }),
-                  g.items.end());
+    for (auto it = g.items.begin(); it != g.items.end();) {
+        if ((*it)->wanted) { ++it; continue; }
+        DestroyItem(it->get());
+        g.retired.push_back(std::move(*it));
+        it = g.items.erase(it);
+    }
 
     RebuildHideActions();
 
@@ -866,6 +876,12 @@ int main(int argc, char** argv) {
     g_signal_connect(g.app, "activate", G_CALLBACK(OnActivate), nullptr);
     // No GTK window is ever created (tray only), so hold the application explicitly.
     g_application_hold(G_APPLICATION(g.app));
+
+    // Re-announce every icon whenever a StatusNotifierWatcher appears (panel restart, upgrade...).
+    g.watcherWatch = g_bus_watch_name_on_connection(
+        g.conn, "org.kde.StatusNotifierWatcher", G_BUS_NAME_WATCHER_FLAGS_NONE,
+        +[](GDBusConnection*, const gchar*, const gchar*, gpointer) { RegisterAllWithWatcher(); },
+        nullptr, nullptr, nullptr);
 
     // First paint (before the worker's first poll) so the icons exist immediately at login.
     RecomputePresentation();
