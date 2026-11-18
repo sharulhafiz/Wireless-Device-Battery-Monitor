@@ -221,7 +221,10 @@ A Linux build sits alongside the Windows app. It uses the same vendor drivers wi
 HID backend and a GTK4 StatusNotifierItem tray icon; the Windows code path is unchanged.
 Every device gets its **own** tray icon (percentage text plus a level bar), so a mouse, a keyboard and
 a headset can be read individually rather than averaged into one number; each icon has its own menu
-with refresh, start at login, hide/show and quit.
+with refresh, start at login, hide/show and quit. A charging device gets a lightning bolt: the state
+comes from the vendor driver or the kernel's hid-* power supply where available, and otherwise from a
+rising level (Bluetooth's Battery Service has no charging flag). `--icon-test out.png` renders every
+icon state for review, and `WB_FORCE_CHARGING=1` previews the charging icon on real hardware.
 Everything reachable over Bluetooth is covered as well: paired and connected devices are read from
 BlueZ (`org.bluez.Battery1` over D-Bus) plus `/sys/class/power_supply/hid-*`, so mice, keyboards,
 headsets and controllers show their level even when no vendor driver speaks for them. Bluetooth needs

@@ -91,6 +91,13 @@ struct State {
     std::vector<DeviceStatus> pending;
     std::atomic<bool> stop{ false };
     bool wake = false;
+    // Charging inference state per device key (see EffectiveCharging).
+    struct ChargeTrack {
+        int percent = -1;
+        gint64 at = 0;
+        gint64 chargingUntil = 0;
+    };
+    std::map<std::string, ChargeTrack> charge;
     std::set<std::wstring> hidden;
     bool hideLastKnown = false;
     bool autostart = false;
@@ -151,29 +158,43 @@ void ApplyAutostart(bool on) {
 
 // ---- icon rendering (Cairo -> SNI pixmap) ------------------------------------------------------
 
-GVariant* RenderPixmap(int pct, bool charging, bool dim, bool low) {
-    const int S = kIconSize;
-    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, S, S);
-    cairo_t* cr = cairo_create(surface);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
-    cairo_paint(cr);
+// Lightning bolt in the upper-right corner: the one thing that says "charging" at tray size.
+void DrawBolt(cairo_t* cr, int S, double alpha) {
+    static const double pts[6][2] = {
+        { 0.86, 0.02 }, { 0.60, 0.50 }, { 0.74, 0.50 },
+        { 0.56, 0.98 }, { 0.88, 0.42 }, { 0.74, 0.42 },
+    };
+    cairo_move_to(cr, pts[0][0] * S, pts[0][1] * S);
+    for (int i = 1; i < 6; i++) cairo_line_to(cr, pts[i][0] * S, pts[i][1] * S);
+    cairo_close_path(cr);
+    // Dark edge under a bright fill keeps the bolt readable on light and dark panels.
+    cairo_set_line_width(cr, S * 0.055);
+    cairo_set_source_rgba(cr, 0.04, 0.04, 0.07, 0.85 * alpha);
+    cairo_stroke_preserve(cr);
+    cairo_set_source_rgba(cr, 0.45, 0.86, 1.0, alpha);
+    cairo_fill(cr);
+}
 
+void DrawIcon(cairo_t* cr, int S, int pct, bool charging, bool dim, bool low) {
     std::string text = pct < 0 ? "?" : std::string(pct >= 100 ? "99" : std::to_string(pct));
     double r = low && !charging ? 0.95 : (charging ? 0.25 : 0.92);
     double g = low && !charging ? 0.25 : (charging ? 0.70 : 0.92);
     double b = low && !charging ? 0.28 : (charging ? 1.00 : 0.92);
     double alpha = dim ? 0.45 : 1.0;
 
-    double fontSize = text.size() >= 3 ? 28 : (text.size() == 2 ? 38 : 46);
+    // The bolt owns the right column, so the number shifts left while charging.
+    double cx = charging ? S * 0.36 : S * 0.50;
+    double fontSize = text.size() >= 3 ? 26 : (text.size() == 2 ? 36 : 44);
+    if (charging) fontSize *= 0.85;
     cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, fontSize);
     cairo_text_extents_t ext{};
     cairo_text_extents(cr, text.c_str(), &ext);
     cairo_set_source_rgba(cr, r, g, b, alpha);
-    cairo_move_to(cr, (S - ext.width) / 2 - ext.x_bearing, S * 0.48 - (ext.height / 2 + ext.y_bearing));
+    cairo_move_to(cr, cx - ext.width / 2 - ext.x_bearing, S * 0.48 - (ext.height / 2 + ext.y_bearing));
     cairo_show_text(cr, text.c_str());
 
-    // Level bar.
+    // Level bar (full width, under everything else).
     int barH = 7, barY = S - barH - 2;
     int fill = pct < 0 ? 0 : std::max(1, (pct * (S - 8)) / 100);
     cairo_set_source_rgba(cr, 1, 1, 1, 0.22);
@@ -184,6 +205,17 @@ GVariant* RenderPixmap(int pct, bool charging, bool dim, bool low) {
                           charging ? 1.0 : (pct <= kLowBattery ? 0.3 : 0.45), alpha);
     cairo_rectangle(cr, 4, barY, fill, barH);
     cairo_fill(cr);
+
+    if (charging) DrawBolt(cr, S, alpha);
+}
+
+GVariant* RenderPixmap(int pct, bool charging, bool dim, bool low) {
+    const int S = kIconSize;
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, S, S);
+    cairo_t* cr = cairo_create(surface);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+    DrawIcon(cr, S, pct, charging, dim, low);
     cairo_destroy(cr);
 
     cairo_surface_flush(surface);
@@ -227,6 +259,38 @@ bool IsVisible(const DeviceStatus& s) {
     if (g.hidden.count(s.key)) return false;
     if (g.hideLastKnown && (s.asleep || (s.percent < 0))) return false;
     return true;
+}
+
+// Is this device charging right now?
+//
+// Only some sources know: vendor drivers (HID++, Sony, ...) and the kernel's hid-* power supply
+// report it. Bluetooth's Battery Service does not, and a mouse on a cable usually drops its radio
+// link entirely, so a rising level is treated as evidence of charging and the mark sticks for a
+// while (the tray polls once a minute, so a rise can arrive in visible steps).
+bool EffectiveCharging(const DeviceStatus& s) {
+    if (s.charging) return true;
+    // Debugging aid: WB_FORCE_CHARGING=1 previews the charging icon without a charger.
+    if (g_getenv("WB_FORCE_CHARGING")) return true;
+    if (s.percent < 0) return false;
+    const gint64 now = g_get_monotonic_time() / G_USEC_PER_SEC;
+    auto& t = g.charge[WideToUtf8(s.key)];
+    bool charging = now < t.chargingUntil;
+    if (t.percent >= 0 && s.percent > t.percent && now - t.at <= 15 * 60) {
+        t.chargingUntil = now + 15 * 60;  // went up: charging; keep showing it for 15 minutes
+        charging = true;
+    }
+    if (t.percent != s.percent) {
+        t.percent = s.percent;
+        t.at = now;
+    }
+    return charging;
+}
+
+// Status line shared by the tooltip and the menu.
+std::wstring StatusLine(const DeviceStatus& s) {
+    std::wstring t = StatusText(s);
+    if (!s.charging && EffectiveCharging(s)) t += L", charging";
+    return t;
 }
 
 int KindOrder(DeviceKind k) {
@@ -611,7 +675,7 @@ void BuildMenuFor(TrayItem& it, const DeviceStatus* dev) {
     it.nodes.clear();
     if (dev) {
         AddMenuNode(it, 0, WideToUtf8(dev->name), "");
-        AddMenuNode(it, 0, WideToUtf8(StatusText(*dev)), "");
+        AddMenuNode(it, 0, WideToUtf8(StatusLine(*dev)), "");
         AddMenuNode(it, 0, "", "", true);
     } else {
         AddMenuNode(it, 0, "No devices with battery info found", "");
@@ -639,11 +703,11 @@ void UpdateItemContent(TrayItem& it, const DeviceStatus* dev) {
     bool charging = false, dim = false, low = false;
     if (dev) {
         pct = dev->percent;
-        charging = dev->charging;
+        charging = EffectiveCharging(*dev);
         low = pct >= 0 && pct <= kLowBattery && !charging;
         dim = dev->asleep || pct < 0;
         it.title = WideToUtf8(dev->name);
-        it.tooltipText = WideToUtf8(StatusText(*dev));
+        it.tooltipText = WideToUtf8(StatusLine(*dev));
         it.status = low ? "NeedsAttention" : (pct < 0 || dev->asleep ? "Passive" : "Active");
     } else {
         it.title = "Wireless Battery";
@@ -817,6 +881,37 @@ int ListToConsole(bool dump) {
     return 0;
 }
 
+// --icon-test <file.png>: renders every icon state side by side, for reviewing the artwork.
+int ExportIconTest(const char* path) {
+    struct Case { int pct; bool charging; bool dim; };
+    const Case cases[] = {
+        { 8, false, false }, { 8, true, false }, { 15, false, false }, { 50, false, false },
+        { 78, false, false }, { 78, true, false }, { 99, false, false }, { -1, false, true },
+    };
+    const int n = (int)(sizeof(cases) / sizeof(cases[0]));
+    const int S = kIconSize;
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, S * n, S);
+    cairo_t* cr = cairo_create(surface);
+    cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);  // dark panel preview
+    cairo_paint(cr);
+    for (int i = 0; i < n; i++) {
+        cairo_save(cr);
+        cairo_translate(cr, i * S, 0);
+        const bool low = cases[i].pct >= 0 && cases[i].pct <= kLowBattery && !cases[i].charging;
+        DrawIcon(cr, S, cases[i].pct, cases[i].charging, cases[i].dim, low);
+        cairo_restore(cr);
+    }
+    cairo_destroy(cr);
+    cairo_status_t st = cairo_surface_write_to_png(surface, path);
+    cairo_surface_destroy(surface);
+    if (st != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Cannot write %s: %s\n", path, cairo_status_to_string(st));
+        return 1;
+    }
+    printf("wrote %s (%d states, left to right: 8, 8-charging, 15, 50, 78, 78-charging, 99, unknown)\n", path, n);
+    return 0;
+}
+
 // --bluetooth: raw view of what BlueZ and sysfs report (helps adding new devices).
 int DumpBluetooth() {
     std::wstring s;
@@ -847,6 +942,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--list")) return ListToConsole(false);
         if (!strcmp(argv[i], "--dump")) return ListToConsole(true);
         if (!strcmp(argv[i], "--bluetooth")) return DumpBluetooth();
+        if (!strcmp(argv[i], "--icon-test")) return ExportIconTest(i + 1 < argc ? argv[++i] : "icons.png");
         if (!strcmp(argv[i], "--quit")) return QuitRunning();
     }
 
