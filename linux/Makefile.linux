@@ -27,7 +27,7 @@ DRIVERS := \
     src/drivers/coolermaster.cpp \
     src/drivers/finalmouse.cpp
 
-SRC := src/linux/hid_linux.cpp src/linux/devices_linux.cpp src/linux/main_linux.cpp $(DRIVERS)
+SRC := src/linux/hid_linux.cpp src/linux/devices_linux.cpp src/linux/bt_linux.cpp src/linux/main_linux.cpp $(DRIVERS)
 OBJ := $(patsubst src/%.cpp,build/linux/%.o,$(SRC))
 TARGET := wireless-battery
 

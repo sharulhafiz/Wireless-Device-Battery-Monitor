@@ -219,6 +219,10 @@ just lose the extra headsets.
 
 A Linux build sits alongside the Windows app. It uses the same vendor drivers with a hidraw-based
 HID backend and a GTK4 StatusNotifierItem tray icon; the Windows code path is unchanged.
+Everything reachable over Bluetooth is covered as well: paired and connected devices are read from
+BlueZ (`org.bluez.Battery1` over D-Bus) plus `/sys/class/power_supply/hid-*`, so mice, keyboards,
+headsets and controllers show their level even when no vendor driver speaks for them. Bluetooth needs
+no udev rule — the udev rule below is only for 2.4 GHz receivers and USB cables.
 All Linux-only files are in `linux/` and `src/linux/`, and `build-linux.sh` builds it (Windows keeps using `build.bat`).
 
 | | Fedora | Ubuntu / Debian |
@@ -233,6 +237,7 @@ No extra HID library is needed (hidraw is used directly).
 ./build-linux.sh test         # unit test for the HID report-descriptor parser
 ./wireless-battery --list     # print detected levels and exit
 ./wireless-battery --dump     # list HID collections
+./wireless-battery --bluetooth  # show what BlueZ / sysfs report
 ./wireless-battery --quit     # close the running tray instance
 ```
 
@@ -249,8 +254,9 @@ The tray icon works natively on KDE Plasma; GNOME needs an AppIndicator host suc
 (install it plus `linux/wireless-battery.svg` and the binary into `~/.local/`).
 
 Phase 1 covers Logitech, Razer, SteelSeries, Corsair, HyperX, PlayStation, Cooler Master, Glorious,
-Finalmouse and the shared Kysona/Pulsar/ATK/G-Wolves protocols. Bluetooth/UPower fallbacks, HeadsetControl and
-the remaining vendors are planned follow-up phases.
+Finalmouse and the shared Kysona/Pulsar/ATK/G-Wolves protocols, plus every Bluetooth device that
+advertises a battery level (BlueZ/sysfs). HeadsetControl and the remaining 2.4 GHz vendors are
+planned follow-up phases.
 
 ## Limitations
 

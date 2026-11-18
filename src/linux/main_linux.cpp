@@ -3,6 +3,7 @@
 // Kept separate from src/main.cpp (Win32 tray + taskbar widget) so the Windows build is not
 // touched. The polling logic and all vendor drivers are shared; only the presentation layer and
 // settings storage differ.
+#include "bt_linux.h"
 #include "../platform_compat.h"
 #include "../devices.h"
 #include "../hid.h"
@@ -632,6 +633,16 @@ int ListToConsole(bool dump) {
     return 0;
 }
 
+// --bluetooth: raw view of what BlueZ and sysfs report (helps adding new devices).
+int DumpBluetooth() {
+    std::wstring s;
+    bool any = DumpBluetoothLinux(s);
+    const std::string u = WideToUtf8(s);
+    fwrite(u.c_str(), 1, u.size(), stdout);
+    if (!any) printf("No Bluetooth battery source found (nothing paired/connected?).\n");
+    return 0;
+}
+
 int QuitRunning() {
     GError* error = nullptr;
     GDBusConnection* conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
@@ -651,6 +662,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) return ListToConsole(false);
         if (!strcmp(argv[i], "--dump")) return ListToConsole(true);
+        if (!strcmp(argv[i], "--bluetooth")) return DumpBluetooth();
         if (!strcmp(argv[i], "--quit")) return QuitRunning();
     }
 
