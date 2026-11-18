@@ -225,6 +225,13 @@ with refresh, start at login, hide/show and quit. A charging device gets a light
 comes from the vendor driver or the kernel's hid-* power supply where available, and otherwise from a
 rising level (Bluetooth's Battery Service has no charging flag). `--icon-test out.png` renders every
 icon state for review, and `WB_FORCE_CHARGING=1` previews the charging icon on real hardware.
+
+A device put on a charging cable usually drops its Bluetooth link and comes back as a USB HID device
+whose firmware reports no battery. Such a device keeps its icon: the level freezes at the last value
+read over the air and the tooltip says `97% (via cable), charging`. Detection uses a 2 s watcher on
+`/sys/class/hidraw` (plug events) plus a baseline comparison against the USB devices present while
+the device was last on the air, and it is class-guarded so a plugged-in keyboard cannot make a mouse
+look like it is charging. `tests/linux_cable_test.cpp` covers the state machine.
 Everything reachable over Bluetooth is covered as well: paired and connected devices are read from
 BlueZ (`org.bluez.Battery1` over D-Bus) plus `/sys/class/power_supply/hid-*`, so mice, keyboards,
 headsets and controllers show their level even when no vendor driver speaks for them. Bluetooth needs
