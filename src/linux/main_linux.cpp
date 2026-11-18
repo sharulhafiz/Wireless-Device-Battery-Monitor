@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -91,6 +92,21 @@ struct State {
     std::vector<DeviceStatus> pending;
     std::atomic<bool> stop{ false };
     bool wake = false;
+    // Devices that left Bluetooth and re-appeared as a USB HID device (i.e. got plugged into a
+    // cable). Their firmware exposes no battery over USB, so the icon keeps the last known level
+    // and is labelled as charging through the cable.
+    struct Remembered {
+        std::string key;
+        std::wstring name;
+        int percent = -1;
+        DeviceKind kind = DeviceKind::Other;
+        std::string usbSig;
+    };
+    std::vector<Remembered> remembered;
+    std::vector<DeviceStatus> view;              // live devices + cable entries (what the UI shows)
+    std::set<std::string> hidSigs;               // USB HID signatures seen in the previous poll
+    std::map<std::string, DeviceStatus> lastSeen;  // device key -> last live status
+    std::vector<std::string> prevLiveKeys;        // keys that were live in the previous poll
     // Charging inference state per device key (see EffectiveCharging).
     struct ChargeTrack {
         int percent = -1;
@@ -241,6 +257,160 @@ GVariant* RenderPixmap(int pct, bool charging, bool dim, bool low) {
     return g_variant_ref_sink(arr);
 }
 
+// ---- USB HID presence (cable detection) --------------------------------------------------------
+
+// "0003:248A:5B2E|XCTECH USB Gaming Mouse" for each /sys/class/hidraw node. Readable without
+// privileges, so it works even before the udev rule is installed.
+std::set<std::string> UsbHidSignatures() {
+    std::set<std::string> sigs;
+    GDir* dir = g_dir_open("/sys/class/hidraw", 0, nullptr);
+    if (!dir) return sigs;
+    const gchar* node = nullptr;
+    while ((node = g_dir_read_name(dir))) {
+        const std::string uevent = std::string("/sys/class/hidraw/") + node + "/device/uevent";
+        g_autofree gchar* text = nullptr;
+        if (!g_file_get_contents(uevent.c_str(), &text, nullptr, nullptr)) continue;
+        std::string id, name;
+        std::stringstream in(text);  // "HID_ID=...\nHID_NAME=...\n" - not a key file
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("HID_ID=", 0) == 0) id = line.substr(7);
+            else if (line.rfind("HID_NAME=", 0) == 0) name = line.substr(9);
+        }
+        if (id.empty()) continue;
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+        g_autofree gchar* up = g_ascii_strup(id.c_str(), -1);
+        sigs.insert(std::string(up) + "|" + name);
+    }
+    g_dir_close(dir);
+    return sigs;
+}
+
+// Guess the device class from a USB product string, so a departed mouse is only paired with a USB
+// device that looks like a mouse (and not, say, with a keyboard plugged in at the same moment).
+DeviceKind KindFromUsbName(const std::string& product) {
+    std::string n;
+    for (char c : product) n.push_back((char)g_ascii_tolower(c));
+    if (n.find("mouse") != std::string::npos) return DeviceKind::Mouse;
+    if (n.find("keyboard") != std::string::npos) return DeviceKind::Keyboard;
+    if (n.find("headset") != std::string::npos || n.find("headphone") != std::string::npos)
+        return DeviceKind::Headset;
+    if (n.find("gamepad") != std::string::npos || n.find("controller") != std::string::npos)
+        return DeviceKind::Gamepad;
+    return DeviceKind::Other;
+}
+
+// Cable entries live in their own tab-separated file: GKeyFile escapes control characters, and a
+// plain file stays readable when something goes wrong.
+std::string CablePath() {
+    return std::string(g_get_user_config_dir()) + "/wireless-battery/cable.tsv";
+}
+
+void SaveRemembered() {
+    std::string out;
+    for (const auto& r : g.remembered)
+        out += r.key + "\t" + WideToUtf8(r.name) + "\t" + std::to_string(r.percent) + "\t" +
+               std::to_string((int)r.kind) + "\t" + r.usbSig + "\n";
+    const std::string path = CablePath();
+    if (out.empty()) { unlink(path.c_str()); return; }
+    g_mkdir_with_parents(g_path_get_dirname(path.c_str()), 0700);
+    g_file_set_contents(path.c_str(), out.c_str(), (gssize)out.size(), nullptr);
+}
+
+void LoadRemembered() {
+    g_autofree gchar* text = nullptr;
+    if (!g_file_get_contents(CablePath().c_str(), &text, nullptr, nullptr)) return;
+    std::stringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> f;
+        size_t start = 0;
+        while (true) {
+            size_t pos = line.find('\t', start);
+            if (pos == std::string::npos) { f.push_back(line.substr(start)); break; }
+            f.push_back(line.substr(start, pos - start));
+            start = pos + 1;
+        }
+        if (f.size() != 5) continue;
+        State::Remembered r;
+        r.key = f[0];
+        r.name = Utf8ToWide(f[1]);
+        r.percent = atoi(f[2].c_str());
+        r.kind = (DeviceKind)atoi(f[3].c_str());
+        r.usbSig = f[4];
+        g.remembered.push_back(r);
+    }
+}
+
+// Rebuilds the cable entries as presentation statuses. A remembered device that is back on the air
+// (Bluetooth again) or whose USB device is gone is dropped.
+void RebuildCableView(const std::set<std::string>& sigs) {
+    std::vector<State::Remembered> keep;
+    for (const auto& r : g.remembered) {
+        if (sigs.count(r.usbSig) == 0) continue;  // cable pulled: no longer charging
+        bool live = false;
+        for (const auto& d : g.devices) if (WideToUtf8(d.key) == r.key) { live = true; break; }
+        if (live) continue;  // back on Bluetooth, the real reading wins
+        keep.push_back(r);
+    }
+    if (keep.size() != g.remembered.size()) {
+        g.remembered.swap(keep);
+        SaveRemembered();
+    }
+    g.view.clear();
+    for (const auto& d : g.devices) g.view.push_back(d);
+    for (const auto& r : g.remembered) {
+        bool live = false;
+        for (const auto& d : g.devices) if (WideToUtf8(d.key) == r.key) { live = true; break; }
+        if (live) continue;
+        DeviceStatus st;
+        st.key = Utf8ToWide(r.key);
+        st.name = r.name;
+        st.via = L"USB cable";
+        st.kind = r.kind;
+        st.percent = r.percent;
+        st.charging = true;   // it is on a cable; the firmware just cannot report the level
+        st.detail = L"via cable";
+        st.connected = true;
+        g.view.push_back(st);
+    }
+}
+
+// A device left the air while a new USB HID device showed up: that is the cable being plugged in.
+void DetectCableSwitch(const std::vector<std::string>& departed, const std::set<std::string>& sigs) {
+    if (departed.empty()) return;
+    std::vector<std::string> appeared;
+    for (const auto& s2 : sigs)
+        if (g.hidSigs.count(s2) == 0) appeared.push_back(s2);
+    if (appeared.empty()) return;
+    for (const auto& key : departed) {
+        auto at = g.lastSeen.find(key);
+        if (at == g.lastSeen.end()) continue;
+        const DeviceStatus& old = at->second;
+        if (old.via != L"Bluetooth") continue;  // only a wireless device can "go on a cable"
+        bool remembered = false;
+        for (const auto& r : g.remembered) if (r.key == key) remembered = true;
+        if (remembered) continue;
+        std::string match;
+        for (const auto& sig : appeared) {
+            const DeviceKind k = KindFromUsbName(sig.substr(sig.find('|') + 1));
+            if (k == DeviceKind::Other || old.kind == DeviceKind::Other || k == old.kind) { match = sig; break; }
+        }
+        if (match.empty()) continue;
+        State::Remembered r;
+        r.key = key;
+        r.name = old.name;
+        r.percent = old.percent;
+        r.kind = old.kind;
+        r.usbSig = match;
+        g.remembered.push_back(r);
+        appeared.erase(std::remove(appeared.begin(), appeared.end(), match), appeared.end());
+        g_warning("Cable detected for \"%s\": last level %d%%", WideToUtf8(r.name).c_str(), r.percent);
+    }
+    SaveRemembered();
+}
+
 // ---- presentation state -----------------------------------------------------------------------
 
 std::wstring StatusText(const DeviceStatus& s) {
@@ -307,7 +477,7 @@ int KindOrder(DeviceKind k) {
 // Devices that deserve their own icon, in a stable order (kind, then name).
 std::vector<const DeviceStatus*> VisibleDevices() {
     std::vector<const DeviceStatus*> list;
-    for (const auto& s : g.devices) if (IsVisible(s)) list.push_back(&s);
+    for (const auto& s : g.view) if (IsVisible(s)) list.push_back(&s);
     std::sort(list.begin(), list.end(), [](const DeviceStatus* a, const DeviceStatus* b) {
         int ka = KindOrder(a->kind), kb = KindOrder(b->kind);
         return ka != kb ? ka < kb : a->name < b->name;
@@ -317,7 +487,7 @@ std::vector<const DeviceStatus*> VisibleDevices() {
 
 const DeviceStatus* DeviceByKey(const std::string& key) {
     if (key.empty()) return nullptr;
-    for (const auto& s : g.devices)
+    for (const auto& s : g.view)
         if (WideToUtf8(s.key) == key) return &s;
     return nullptr;
 }
@@ -829,10 +999,28 @@ void RecomputePresentation() {
 }
 
 void ApplyResults() {
+    std::vector<DeviceStatus> fresh;
     {
         std::lock_guard<std::mutex> lock(g.mu);
         g.devices.swap(g.pending);
+        fresh = g.devices;
     }
+    // Devices that were live in the previous poll and are gone now.
+    std::vector<std::string> departed;
+    for (const auto& key : g.prevLiveKeys) {
+        bool still = false;
+        for (const auto& d : fresh) if (WideToUtf8(d.key) == key) { still = true; break; }
+        if (!still) departed.push_back(key);
+    }
+    g.prevLiveKeys.clear();
+    for (const auto& d : fresh) g.prevLiveKeys.push_back(WideToUtf8(d.key));
+
+    const std::set<std::string> sigs = UsbHidSignatures();
+    DetectCableSwitch(departed, sigs);
+    g.hidSigs = sigs;
+
+    for (const auto& d : fresh) g.lastSeen[WideToUtf8(d.key)] = d;
+    RebuildCableView(sigs);
     RecomputePresentation();
 }
 
@@ -947,6 +1135,7 @@ int main(int argc, char** argv) {
     }
 
     LoadSettings();
+    LoadRemembered();
     g_autoptr(GError) error = nullptr;
     if (!gtk_init_check()) { fprintf(stderr, "Cannot initialise GTK (no display?).\n"); return 1; }
 
@@ -980,6 +1169,8 @@ int main(int argc, char** argv) {
         nullptr, nullptr, nullptr);
 
     // First paint (before the worker's first poll) so the icons exist immediately at login.
+    g.hidSigs = UsbHidSignatures();
+    RebuildCableView(g.hidSigs);
     RecomputePresentation();
 
     std::thread worker(Worker);
