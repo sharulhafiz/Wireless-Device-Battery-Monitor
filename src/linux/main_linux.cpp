@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -104,9 +105,22 @@ struct State {
     };
     std::vector<Remembered> remembered;
     std::vector<DeviceStatus> view;              // live devices + cable entries (what the UI shows)
-    std::set<std::string> hidSigs;               // USB HID signatures seen in the previous poll
-    std::map<std::string, DeviceStatus> lastSeen;  // device key -> last live status
-    std::vector<std::string> prevLiveKeys;        // keys that were live in the previous poll
+    std::set<std::string> hidSigs;               // USB HID signatures present right now
+    // Polling once a minute cannot see a five-second unplug, so a 2 s watcher records USB HID
+    // appearance/disappearance events and the battery poll pairs them with a departed device.
+    struct UsbEvent {
+        std::string sig;
+        bool appeared = true;
+        gint64 at = 0;
+    };
+    std::vector<UsbEvent> usbEvents;             // guarded by mu
+    struct SeenEntry {
+        DeviceStatus status;
+        gint64 at = 0;                             // when it was last live (wall clock, seconds)
+        std::set<std::string> sigs;                // USB HID devices present at that moment
+        bool fromDisk = false;                     // restored from lastseen.tsv
+    };
+    std::map<std::string, SeenEntry> lastSeen;   // device key -> last live status
     // Charging inference state per device key (see EffectiveCharging).
     struct ChargeTrack {
         int percent = -1;
@@ -343,6 +357,69 @@ void LoadRemembered() {
     }
 }
 
+std::string LastSeenPath() {
+    return std::string(g_get_user_config_dir()) + "/wireless-battery/lastseen.tsv";
+}
+
+// Best-effort cache of what was on the air last: after a restart the cable entry can still be
+// recognised, and the level shown for a cabled device is not lost on every login.
+void SaveLastSeen() {
+    const gint64 now = (gint64)time(nullptr);
+    std::string out;
+    std::vector<std::pair<gint64, std::string>> rows;
+    for (const auto& [key, seen] : g.lastSeen) {
+        if (now - seen.at > 7 * 24 * 3600) continue;
+        std::string sigs;
+        for (const auto& sig : seen.sigs) { sigs += sig; sigs.push_back('\x1e'); }
+        rows.emplace_back(seen.at,
+                          key + "\t" + WideToUtf8(seen.status.name) + "\t" + WideToUtf8(seen.status.via) +
+                              "\t" + std::to_string((int)seen.status.kind) + "\t" +
+                              std::to_string(seen.status.percent) + "\t" + std::to_string(seen.at) +
+                              "\t" + sigs + "\n");
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = 0; i < rows.size() && i < 32; i++) out += rows[i].second;
+    if (out.empty()) { unlink(LastSeenPath().c_str()); return; }
+    g_mkdir_with_parents(g_path_get_dirname(LastSeenPath().c_str()), 0700);
+    g_file_set_contents(LastSeenPath().c_str(), out.c_str(), (gssize)out.size(), nullptr);
+}
+
+void LoadLastSeen() {
+    g_autofree gchar* text = nullptr;
+    if (!g_file_get_contents(LastSeenPath().c_str(), &text, nullptr, nullptr)) return;
+    std::stringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> f;
+        size_t start = 0;
+        while (true) {
+            size_t pos = line.find('\t', start);
+            if (pos == std::string::npos) { f.push_back(line.substr(start)); break; }
+            f.push_back(line.substr(start, pos - start));
+            start = pos + 1;
+        }
+        if (f.size() != 7) continue;
+        State::SeenEntry seen;
+        seen.status.key = Utf8ToWide(f[0]);
+        seen.status.name = Utf8ToWide(f[1]);
+        seen.status.via = Utf8ToWide(f[2]);
+        seen.status.kind = (DeviceKind)atoi(f[3].c_str());
+        seen.status.percent = atoi(f[4].c_str());
+        seen.status.connected = true;
+        seen.at = atoll(f[5].c_str());
+        seen.fromDisk = true;
+        size_t sigStart = 0;
+        while (sigStart < f[6].size()) {
+            size_t pos = f[6].find('\x1e', sigStart);
+            if (pos == std::string::npos) { seen.sigs.insert(f[6].substr(sigStart)); break; }
+            seen.sigs.insert(f[6].substr(sigStart, pos - sigStart));
+            sigStart = pos + 1;
+        }
+        g.lastSeen[f[0]] = seen;
+    }
+}
+
 // Rebuilds the cable entries as presentation statuses. A remembered device that is back on the air
 // (Bluetooth again) or whose USB device is gone is dropped.
 void RebuildCableView(const std::set<std::string>& sigs) {
@@ -377,25 +454,50 @@ void RebuildCableView(const std::set<std::string>& sigs) {
     }
 }
 
-// A device left the air while a new USB HID device showed up: that is the cable being plugged in.
-void DetectCableSwitch(const std::vector<std::string>& departed, const std::set<std::string>& sigs) {
-    if (departed.empty()) return;
-    std::vector<std::string> appeared;
-    for (const auto& s2 : sigs)
-        if (g.hidSigs.count(s2) == 0) appeared.push_back(s2);
-    if (appeared.empty()) return;
-    for (const auto& key : departed) {
-        auto at = g.lastSeen.find(key);
-        if (at == g.lastSeen.end()) continue;
-        const DeviceStatus& old = at->second;
-        if (old.via != L"Bluetooth") continue;  // only a wireless device can "go on a cable"
-        bool remembered = false;
-        for (const auto& r : g.remembered) if (r.key == key) remembered = true;
-        if (remembered) continue;
+// A device that was on the air recently and is gone now, while a USB HID device of the same class
+// showed up in the last minutes, is a device plugged into a cable to charge.
+void DetectCableSwitch() {
+    const gint64 now = (gint64)time(nullptr);
+    std::vector<std::string> candidates;
+    for (const auto& [key, seen] : g.lastSeen) {
+        if (now - seen.at > (seen.fromDisk ? 24 * 3600 : 600)) continue;
+        bool live = false;
+        for (const auto& d : g.devices) if (WideToUtf8(d.key) == key) { live = true; break; }
+        if (live) continue;
+        if (seen.status.via != L"Bluetooth") continue;
+        bool known = false;
+        for (const auto& r : g.remembered) if (r.key == key) known = true;
+        if (!known) candidates.push_back(key);
+    }
+    if (candidates.empty()) return;
+
+    bool changed = false;
+    for (const auto& key : candidates) {
+        const DeviceStatus old = g.lastSeen[key].status;
+        const std::set<std::string> baseline = g.lastSeen[key].sigs;
         std::string match;
-        for (const auto& sig : appeared) {
-            const DeviceKind k = KindFromUsbName(sig.substr(sig.find('|') + 1));
-            if (k == DeviceKind::Other || old.kind == DeviceKind::Other || k == old.kind) { match = sig; break; }
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            for (auto ev = g.usbEvents.begin(); ev != g.usbEvents.end();) {
+                if (ev->at < now - 600) { ev = g.usbEvents.erase(ev); continue; }
+                if (!ev->appeared || ev->at < now - 300 || g.hidSigs.count(ev->sig) == 0) { ++ev; continue; }
+                const DeviceKind k = KindFromUsbName(ev->sig.substr(ev->sig.find('|') + 1));
+                if (k != DeviceKind::Other && old.kind != DeviceKind::Other && k != old.kind) { ++ev; continue; }
+                match = ev->sig;
+                ev = g.usbEvents.erase(ev);
+                break;
+            }
+            if (match.empty()) {
+                // No event seen (the swap happened between polls): any USB HID device that was not
+                // present while the device was still on the air is the cable it was plugged into.
+                for (const auto& sig : g.hidSigs) {
+                    if (baseline.count(sig)) continue;
+                    const DeviceKind k = KindFromUsbName(sig.substr(sig.find('|') + 1));
+                    if (k != DeviceKind::Other && old.kind != DeviceKind::Other && k != old.kind) continue;
+                    match = sig;
+                    break;
+                }
+            }
         }
         if (match.empty()) continue;
         State::Remembered r;
@@ -405,10 +507,34 @@ void DetectCableSwitch(const std::vector<std::string>& departed, const std::set<
         r.kind = old.kind;
         r.usbSig = match;
         g.remembered.push_back(r);
-        appeared.erase(std::remove(appeared.begin(), appeared.end(), match), appeared.end());
-        g_warning("Cable detected for \"%s\": last level %d%%", WideToUtf8(r.name).c_str(), r.percent);
+        changed = true;
+        g_message("Cable detected for \"%s\": last level %d%%", WideToUtf8(r.name).c_str(), r.percent);
     }
-    SaveRemembered();
+    if (changed) SaveRemembered();
+}
+
+// 2 s USB HID watcher: keeps hidSigs current and records plug/unplug events.
+void UsbWatch() {
+    auto previous = UsbHidSignatures();
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        g.hidSigs = previous;
+    }
+    while (!g.stop) {
+        g_usleep(2 * G_USEC_PER_SEC);
+        auto current = UsbHidSignatures();
+        const gint64 now = g_get_monotonic_time() / G_USEC_PER_SEC;
+        {
+            std::lock_guard<std::mutex> lock(g.mu);
+            for (const auto& sig : current)
+                if (previous.count(sig) == 0) g.usbEvents.push_back({ sig, true, now });
+            for (const auto& sig : previous)
+                if (current.count(sig) == 0) g.usbEvents.push_back({ sig, false, now });
+            while (g.usbEvents.size() > 64) g.usbEvents.erase(g.usbEvents.begin());
+            g.hidSigs = current;
+        }
+        previous = current;
+    }
 }
 
 // ---- presentation state -----------------------------------------------------------------------
@@ -1005,21 +1131,22 @@ void ApplyResults() {
         g.devices.swap(g.pending);
         fresh = g.devices;
     }
-    // Devices that were live in the previous poll and are gone now.
-    std::vector<std::string> departed;
-    for (const auto& key : g.prevLiveKeys) {
-        bool still = false;
-        for (const auto& d : fresh) if (WideToUtf8(d.key) == key) { still = true; break; }
-        if (!still) departed.push_back(key);
+    const gint64 now = (gint64)time(nullptr);
+    std::set<std::string> currentSigs;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        currentSigs = g.hidSigs;
     }
-    g.prevLiveKeys.clear();
-    for (const auto& d : fresh) g.prevLiveKeys.push_back(WideToUtf8(d.key));
+    for (const auto& d : fresh)
+        g.lastSeen[WideToUtf8(d.key)] = State::SeenEntry{ d, now, currentSigs, false };
+    SaveLastSeen();
 
-    const std::set<std::string> sigs = UsbHidSignatures();
-    DetectCableSwitch(departed, sigs);
-    g.hidSigs = sigs;
-
-    for (const auto& d : fresh) g.lastSeen[WideToUtf8(d.key)] = d;
+    DetectCableSwitch();
+    std::set<std::string> sigs;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        sigs = g.hidSigs;
+    }
     RebuildCableView(sigs);
     RecomputePresentation();
 }
@@ -1125,6 +1252,7 @@ int QuitRunning() {
 
 }  // namespace
 
+#ifndef WB_NO_MAIN
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) return ListToConsole(false);
@@ -1136,6 +1264,7 @@ int main(int argc, char** argv) {
 
     LoadSettings();
     LoadRemembered();
+    LoadLastSeen();
     g_autoptr(GError) error = nullptr;
     if (!gtk_init_check()) { fprintf(stderr, "Cannot initialise GTK (no display?).\n"); return 1; }
 
@@ -1169,14 +1298,22 @@ int main(int argc, char** argv) {
         nullptr, nullptr, nullptr);
 
     // First paint (before the worker's first poll) so the icons exist immediately at login.
-    g.hidSigs = UsbHidSignatures();
-    RebuildCableView(g.hidSigs);
+    {
+        const std::set<std::string> sigs = UsbHidSignatures();
+        std::lock_guard<std::mutex> lock(g.mu);
+        g.hidSigs = sigs;
+        RebuildCableView(sigs);
+    }
     RecomputePresentation();
 
     std::thread worker(Worker);
+    std::thread usbWatch(UsbWatch);
     int status = g_application_run(G_APPLICATION(g.app), argc, argv);
     g.stop = true;
     g.cv.notify_all();
     worker.join();
+    usbWatch.join();
     return status;
 }
+#endif  // WB_NO_MAIN
+

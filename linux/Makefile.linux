@@ -38,10 +38,17 @@ build/linux/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(GTK_CFLAGS) -c $< -o $@
 
+# Cable-switch detection test: includes src/linux/main_linux.cpp with WB_NO_MAIN so the pairing
+# state machine can be driven directly, without a real unplug/replug.
+CABLE_HDRS := $(filter-out build/linux/linux/main_linux.o,$(OBJ))
+
 test:
 	@mkdir -p build/linux
 	$(CXX) $(CXXFLAGS) tests/linux_hid_test.cpp -o build/linux/linux_hid_test
 	./build/linux/linux_hid_test
+	$(CXX) $(CXXFLAGS) $(GTK_CFLAGS) -DWB_NO_MAIN tests/linux_cable_test.cpp $(CABLE_HDRS) \
+	    -o build/linux/linux_cable_test $(GTK_LIBS) -pthread
+	XDG_CONFIG_HOME=$(CURDIR)/build/linux/cfg ./build/linux/linux_cable_test
 
 clean:
 	rm -rf build/linux $(TARGET)
