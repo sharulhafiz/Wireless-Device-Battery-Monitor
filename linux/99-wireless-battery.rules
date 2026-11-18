@@ -1,4 +1,11 @@
-# Allow the active desktop user to read HID battery reports without running as root.
-# Uses logind's "uaccess" tag, so access follows the active session and no world-writable
-# permissions are needed. Reload with: sudo udevadm control --reload-rules && sudo udevadm trigger
-SUBSYSTEM=="hidraw", TAG+="uaccess"
+# Allow the desktop user to read HID battery reports without running as root.
+#
+# TAG+="uaccess" alone is not enough on machines where the graphical session is not the active
+# logind session (remote/VNC sessions, or a session left in "closing"): logind then never applies
+# the ACL and /dev/hidraw* stays 0600 root:root. The group grant below always works; hidraw needs
+# write access for vendor GET/SET_FEATURE queries, so the group is read-write.
+#
+# Reload with:
+#   sudo install -m644 99-wireless-battery.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw
+SUBSYSTEM=="hidraw", TAG+="uaccess", GROUP="plugdev", MODE="0660"
